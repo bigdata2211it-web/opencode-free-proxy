@@ -43,8 +43,17 @@ function ocId(prefix) {
 }
 
 const MODELS = [
-  "deepseek-v4-flash-free",
+  // free models per https://opencode.ai/docs/zen and /zen/v1/models
   "big-pickle",
+  "x-preview-f-free",
+  "mimo-v2.5-free",
+  "hy3-free",
+  "nemotron-3-ultra-free",
+  "nemotron-3.5-lightning-free",
+  "muse-spark-1.2-contributor-free",
+  "laguna-s-2.1-free",
+  "deepseek-v4-flash-free",
+  // legacy ids kept for compatibility
   "minimax-m2.5-free",
   "nemotron-3-super-free",
   "qwen3.6-plus-free",
