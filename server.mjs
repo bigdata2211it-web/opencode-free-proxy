@@ -90,11 +90,31 @@ function zenRequest(model, messages, stream, tools, tool_choice, sessionId) {
   };
 }
 
-// Pipe Zen response to client (OpenAI format passthrough)
-function pipeZenResponse(zenOpts, body, stream, res) {
+// Pipe Zen response to client (OpenAI format passthrough) with retry on transient upstream errors
+const RETRY_STATUS = new Set([404, 408, 429, 500, 502, 503, 504]);
+function pipeZenResponse(zenOpts, body, stream, res, attempt = 0) {
   const req = https.request(zenOpts, (zenRes) => {
     let firstChunk = null;
     let headersSent = false;
+    console.log(`[ZEN STATUS] ${zenRes.statusCode} model=${zenOpts.body ? "" : ""}${attempt > 0 ? "attempt=" + attempt : ""}`);
+    if (RETRY_STATUS.has(zenRes.statusCode) && attempt < 3) {
+      const chunks = [];
+      zenRes.on("data", c => chunks.push(c));
+      zenRes.on("end", () => {
+        const raw = Buffer.concat(chunks).toString().trim();
+        if (!raw || raw === "Not Found" || !raw.startsWith("{") || raw.startsWith('"')) {
+          console.log(`[ZEN RETRY] status=${zenRes.statusCode} attempt=${attempt + 1}`);
+          setTimeout(() => pipeZenResponse(zenOpts, body, stream, res, attempt + 1), 500 * (attempt + 1));
+          return;
+        }
+        // Real JSON error body: pass through
+        if (!res.headersSent) {
+          res.writeHead(zenRes.statusCode, { "Content-Type": "application/json" });
+          res.end(raw);
+        }
+      });
+      return;
+    }
 
     zenRes.on("data", (chunk) => {
       if (!firstChunk) {
@@ -546,6 +566,113 @@ app.post("/v1/messages", async (req, res) => {
   }
 });
 
+// ── OpenAI Responses API (/v1/responses) ───────────────────────────
+function responsesToChat(body) {
+  const messages = [];
+  if (body.instructions) messages.push({ role: "system", content: body.instructions });
+  const input = typeof body.input === "string" ? [{ role: "user", content: body.input }] : body.input || [];
+  for (const item of input) {
+    if (item.type === "function_call") {
+      messages.push({ role: "assistant", content: null, tool_calls: [{ id: item.call_id, type: "function", function: { name: item.name, arguments: item.arguments || "{}" } }] });
+    } else if (item.type === "function_call_output") {
+      const out = typeof item.output === "string" ? item.output : JSON.stringify(item.output || "");
+      messages.push({ role: "tool", tool_call_id: item.call_id, content: out });
+    } else if (item.role) {
+      let text = item.content;
+      if (Array.isArray(item.content)) {
+        text = item.content.filter(p => p.type === "input_text" || p.type === "output_text" || p.type === "text").map(p => p.text || "").join("\n");
+      }
+      messages.push({ role: item.role === "tool" ? "tool" : item.role, content: text ?? "" });
+    } else if (item.type === "message") {
+      const text = (item.content || []).filter(p => p.text).map(p => p.text).join("\n");
+      messages.push({ role: item.role, content: text });
+    }
+  }
+  const tools = (body.tools || []).filter(t => t.type === "function").map(t => ({
+    type: "function",
+    function: { name: t.name, description: t.description || "", parameters: t.parameters || {} },
+  }));
+  return { messages, tools: tools.length ? tools : undefined };
+}
+
+function chatToResponses(oai, model) {
+  const choice = oai.choices?.[0] || {};
+  const msg = choice.message || {};
+  const output = [];
+  const text = msg.content || "";
+  if (msg.reasoning_content) {
+    output.push({ type: "reasoning", id: "rs_" + ocId("").slice(3), summary: [{ type: "summary_text", text: msg.reasoning_content }] });
+  }
+  if (text) {
+    output.push({ type: "message", id: "msg_" + ocId("").slice(3), role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] });
+  }
+  for (const tc of msg.tool_calls || []) {
+    let args = tc.function?.arguments || "{}";
+    try { JSON.parse(args); } catch { args = JSON.stringify(args); }
+    output.push({ type: "function_call", id: "fc_" + ocId("").slice(3), call_id: tc.id, name: tc.function?.name, arguments: args, status: "completed" });
+  }
+  const u = oai.usage || {};
+  return {
+    id: "resp_" + ocId("").slice(3), object: "response", created_at: Math.floor(Date.now() / 1000),
+    status: "completed", model,
+    output,
+    usage: { input_tokens: u.prompt_tokens || 0, output_tokens: u.completion_tokens || 0, total_tokens: u.total_tokens || 0, output_tokens_details: { reasoning_tokens: u.completion_tokens_details?.reasoning_tokens || 0 } },
+    parallel_tool_calls: true, tool_choice: "auto", tools: [], error: null, incomplete_details: null, metadata: {},
+  };
+}
+
+app.post("/v1/responses", async (req, res) => {
+  const user = auth(req);
+  if (!user) return res.status(401).json({ error: { message: "Invalid API key" } });
+
+  const { model, stream } = req.body;
+  if (!MODELS.includes(model)) {
+    return res.status(400).json({ error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
+  }
+
+  const sessionId = getSession(user);
+  const { messages, tools } = responsesToChat(req.body);
+  console.log("[RESP]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
+
+  const { body, options } = zenRequest(model, messages, false, tools, req.body.tool_choice !== undefined && req.body.tool_choice !== "auto" ? req.body.tool_choice : undefined, sessionId);
+  try {
+    const zenResp = await zenRequestFull(options, body);
+    if (zenResp.status === 429 || zenResp.data?.error) {
+      const errMsg = zenResp.data?.error?.message || "Rate limit exceeded";
+      return res.status(429).json({ error: { message: errMsg + " (free model rate limit)", type: "rate_limit_error", code: "rate_limit_exceeded" } });
+    }
+    if (!zenResp.data?.choices) {
+      return res.status(502).json({ error: { message: "Invalid upstream response", type: "upstream_error" } });
+    }
+    const resp = chatToResponses(zenResp.data, model);
+    if (!stream) return res.json(resp);
+    // Emit as Responses SSE stream
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive" });
+    const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    send("response.created", { type: "response.created", response: { ...resp, output: [], status: "in_progress" } });
+    for (const item of resp.output) {
+      send("response.output_item.added", { type: "response.output_item.added", output_index: resp.output.indexOf(item), item });
+      if (item.type === "message") {
+        send("response.content_part.added", { type: "response.content_part.added", item_id: item.id, output_index: 0, content_index: 0, part: item.content[0] });
+        send("response.output_text.delta", { type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: item.content[0].text });
+        send("response.output_text.done", { type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text: item.content[0].text });
+        send("response.content_part.done", { type: "response.content_part.done", item_id: item.id, output_index: 0, content_index: 0, part: item.content[0] });
+      }
+      if (item.type === "function_call") {
+        send("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: item.id, output_index: 0, delta: item.arguments });
+        send("response.function_call_arguments.done", { type: "response.function_call_arguments.done", item_id: item.id, output_index: 0, arguments: item.arguments });
+      }
+      send("response.output_item.done", { type: "response.output_item.done", output_index: resp.output.indexOf(item), item });
+    }
+    send("response.completed", { type: "response.completed", response: resp });
+    res.end();
+  } catch (e) {
+    console.log("[ZEN ERROR]", e.message);
+    if (!res.headersSent) res.status(502).json({ error: { message: "Upstream error: " + e.message, type: "upstream_error" } });
+    else res.end();
+  }
+});
+
 // ── Health ──────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({
   status: "ok", version: `v${PROXY_VERSION}`, models: MODELS.length,
@@ -553,6 +680,12 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 // ── Start ──────────────────────────────────────────────────────────
+// Log any request that didn't match a route (ZCode 404 diagnosis)
+app.use((req, res) => {
+  console.log(`[NO ROUTE] ${req.method} ${req.originalUrl} from ${req.ip}`);
+  res.status(404).json({ error: { message: `No route: ${req.method} ${req.originalUrl}` } });
+});
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://0.0.0.0:${PORT}`);
   console.log("  OpenAI:    POST /v1/chat/completions");
