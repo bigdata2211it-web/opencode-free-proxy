@@ -80,13 +80,55 @@ def oc_id(prefix: str) -> str:
     return f"{prefix}_{ts}{rnd}"
 
 
-MODELS = [
+# Models are auto-discovered from opencode.ai's catalog at startup.
+# Fallback list is used only if discovery fails (offline, API down, etc.).
+FALLBACK_MODELS = [
     "ocf-mimo-v2.5-free",
     "ocf-deepseek-v4-flash-free",
     "ocf-north-mini-code-free",
     "ocf-nemotron-3-ultra-free",
     "ocf-big-pickle",
 ]
+
+
+def _is_free(cost: dict | None) -> bool:
+    if not cost:
+        return False
+    for v in cost.values():
+        if isinstance(v, (dict, list)):
+            continue  # tiers / sub-objects
+        if not isinstance(v, (int, float)) or v != 0:
+            return False
+    return True
+
+
+def discover_models() -> list[str]:
+    """Fetch the model catalog and pick the free models.
+
+    A model counts as free when every billing field of its cost in
+    models.opencode.ai/api.json is zero AND it is actually exposed by
+    the public Zen API (opencode.ai/zen/v1/models). The latter filters
+    out zero-cost models that still require a subscription.
+    """
+    try:
+        with httpx.Client(timeout=30.0, proxy=PROXY_URL) as client:
+            catalog = client.get("https://models.opencode.ai/api.json").json()
+            zen = client.get("https://opencode.ai/zen/v1/models").json()
+    except Exception as e:
+        log(f"MODELS discovery failed ({e}), using fallback list")
+        return list(FALLBACK_MODELS)
+
+    oc_models = (catalog.get("opencode") or {}).get("models") or {}
+    zen_ids = [m.get("id") for m in (zen.get("data") or [])]
+    free = [f"ocf-{m}" for m in zen_ids if _is_free((oc_models.get(m) or {}).get("cost"))]
+    if not free:
+        log("MODELS discovery returned nothing, using fallback list")
+        return list(FALLBACK_MODELS)
+    return free
+
+
+MODELS = discover_models()
+log(f"MODELS: {', '.join(MODELS)}")
 
 # Session per conversation (hash-based lookup)
 import hashlib

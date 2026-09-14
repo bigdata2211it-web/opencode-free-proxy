@@ -51,13 +51,20 @@ python server.py --port 6446 --host 127.0.0.1 --proxy socks5://127.0.0.1:9150 --
 
 ## What you get
 
-| Model | What it is | Reliability | Works with proxy | Works without proxy |
-|-------|-----------|-------------|------------------|---------------------|
-| `mimo-v2.5-free` | Xiaomi MiMo v2.5 | Solid | ✅ | ✅ |
-| `deepseek-v4-flash-free` | DeepSeek V4 Flash | Solid | ✅ | ✅ |
-| `north-mini-code-free` | North Mini Code | Solid | ✅ | ✅ |
-| `nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra | Solid | ✅ | ⚠️ sometimes fails |
-| `big-pickle` | DeepSeek V4 Flash (alias) | Solid | ✅ | ✅ |
+The model list is **auto-discovered at startup** from `models.opencode.ai/api.json`: it fetches the catalog and the public Zen API (`/zen/v1/models`), then keeps only models exposed there whose cost is zero across all billing fields. No need to hardcode — new free models appear automatically on restart.
+
+Models are exposed with the `ocf-` prefix (e.g. `ocf-deepseek-v4-flash-free`). Latest discovered set (check `/v1/models` for the live list):
+
+| Model | What it is |
+|-------|-----------|
+| `mimo-v2.5-free` | Xiaomi MiMo v2.5 |
+| `deepseek-v4-flash-free` | DeepSeek V4 Flash |
+| `muse-spark-1.3-contributor-free` | Muse Spark 1.3 |
+| `muse-spark-1.2-contributor-free` | Muse Spark 1.2 |
+| `ling-3.0-flash-fin-free` | Ling 3.0 Flash Fin |
+| `nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra |
+| `nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning |
+| `big-pickle` | Reasoning model |
 
 All models support streaming, tool calls, and system messages.
 
