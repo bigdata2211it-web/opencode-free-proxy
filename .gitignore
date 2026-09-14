@@ -1,4 +1,7 @@
-node_modules/
 api-keys.json
 *.log
+*.err
 .env
+__pycache__/
+*.pyc
+*.bak
