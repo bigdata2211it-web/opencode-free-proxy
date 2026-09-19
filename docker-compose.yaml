@@ -1,0 +1,43 @@
+# Production
+# Usage: docker compose -f docker-compose.yaml up -d --build
+services:
+  proxy:
+    build: .
+    image: opencode-free-proxy:latest
+    container_name: opencode-free-proxy
+    ports:
+      # Prefer loopback if only local clients; use 6446:6446 for LAN exposure
+      - "${PROXY_BIND:-127.0.0.1}:${PROXY_PORT:-6446}:6446"
+    environment:
+      PROXY_PORT: "6446"
+      KEYS_FILE: /data/api-keys.json
+      NODE_ENV: production
+      # Prefer Docker secrets / compose env file over plaintext in shell history
+      ADMIN_API_KEY: "${ADMIN_API_KEY:-}"
+      USER_DEFAULT_API_KEY: "${USER_DEFAULT_API_KEY:-}"
+      # Production default: less I/O leakage in logs
+      LOG_DETAIL: "${LOG_DETAIL:-0}"
+      LOG_MAX_CHARS: "${LOG_MAX_CHARS:-0}"
+      FORCE_COLOR: "${FORCE_COLOR:-}"
+    volumes:
+      - proxy-data:/data
+    # ── Hardening ───────────────────────────────────────────
+    read_only: true
+    tmpfs:
+      - /tmp:nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+    restart: unless-stopped
+
+volumes:
+  proxy-data:

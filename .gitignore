@@ -2,3 +2,13 @@ node_modules/
 api-keys.json
 *.log
 .env
+
+# OpenCode
+.omo/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store

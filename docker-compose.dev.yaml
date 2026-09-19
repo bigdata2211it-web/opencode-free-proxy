@@ -1,0 +1,32 @@
+# Development — bind-mounts source, hot-reload via node --watch
+# Usage: docker compose -f docker-compose.dev.yaml up
+services:
+  proxy:
+    image: node:24-alpine
+    container_name: opencode-free-proxy-dev
+    working_dir: /app
+    ports:
+      - "${PROXY_PORT:-6446}:6446"
+    environment:
+      PROXY_PORT: "6446"
+      KEYS_FILE: /app/api-keys.json
+      NODE_ENV: development
+      NODE_OPTIONS: --use-openssl-ca
+      # API keys — omit to auto-generate
+      ADMIN_API_KEY: "${ADMIN_API_KEY:-}"
+      USER_DEFAULT_API_KEY: "${USER_DEFAULT_API_KEY:-}"
+      # Full I/O logs (set LOG_DETAIL=0 to disable; LOG_MAX_CHARS to truncate)
+      LOG_DETAIL: "${LOG_DETAIL:-1}"
+      LOG_MAX_CHARS: "${LOG_MAX_CHARS:-0}"
+      # FORCE_COLOR=1 if using `docker compose logs -f` (non-TTY)
+      FORCE_COLOR: "${FORCE_COLOR:-}"
+    volumes:
+      # Edit code on host → container picks up changes immediately
+      - .:/app
+      # Keep container node_modules separate from host
+      - proxy-node-modules:/app/node_modules
+    command: sh -c "npm install --cafile=/etc/ssl/certs/ca-certificates.crt && npm run dev"
+    restart: unless-stopped
+
+volumes:
+  proxy-node-modules:
