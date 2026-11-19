@@ -42,13 +42,81 @@ function ocId(prefix) {
   return `${prefix}_${ts}${rnd}`;
 }
 
-const MODELS = [
-  "deepseek-v4-flash-free",
+// ── Upstream credential ────────────────────────────────────────────
+// 上游 opencode.ai/zen 的匿名通道(Bearer public)自 2026-10 起被限流：
+//   FreeUsageLimitError: Free usage limit reached.
+// 设置 OPENCODE_TOKEN 为自己的 OpenCode 账号 token 即可恢复。
+const ZEN_TOKEN = process.env.OPENCODE_TOKEN || "public";
+const ZEN_HOST = process.env.ZEN_HOST || "opencode.ai";
+
+function zenHeaders(requestId, sessionId) {
+  return {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${ZEN_TOKEN}`,
+    "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
+    "x-opencode-client": "cli",
+    "x-opencode-project": "global",
+    "x-opencode-request": requestId || ocId("msg"),
+    "x-opencode-session": sessionId || ocId("ses"),
+  };
+}
+
+// ── Models ─────────────────────────────────────────────────────────
+// 兜底名单：2026-11 实测上游仍存在的免费模型；启动时会被 refreshModels() 覆盖。
+const FALLBACK_MODELS = [
   "big-pickle",
-  "minimax-m2.5-free",
-  "nemotron-3-super-free",
-  "qwen3.6-plus-free",
+  "mimo-v2.6-flash-free",
+  "deepseek-v4.1-flash-free",
+  "hy4-flash-free",
+  "longcat-2.5-free",
+  "iceman-free",
+  "inkling-2-small-free",
+  "beam-free",
+  "flint-40b-free",
+  "nemotron-3.5-super-vl-free",
+  "nemotron-3.5-lightning-free",
+  "tidepool-alpha-free",
 ];
+let MODELS = FALLBACK_MODELS.slice();
+let MODELS_SOURCE = "fallback";
+
+async function refreshModels() {
+  const override = (process.env.MODELS || "").split(",").map((x) => x.trim()).filter(Boolean);
+  if (override.length) {
+    MODELS = override;
+    MODELS_SOURCE = "env";
+    return MODELS;
+  }
+  try {
+    const data = await new Promise((resolve, reject) => {
+      const req = https.request(
+        { hostname: ZEN_HOST, port: 443, path: "/zen/v1/models", method: "GET", headers: zenHeaders(), timeout: 20000 },
+        (r) => {
+          let b = "";
+          r.on("data", (c) => (b += c));
+          r.on("end", () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
+        }
+      );
+      req.on("error", reject);
+      req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+      req.end();
+    });
+    const ids = (data.data || []).map((m) => m.id).filter(Boolean);
+    const free = ids.filter((id) => /-free$/.test(id) || id === "big-pickle");
+    if (free.length) {
+      MODELS = free.sort();
+      MODELS_SOURCE = "upstream " + new Date().toISOString();
+      console.log(`[MODELS] loaded ${MODELS.length} free models from upstream`);
+    }
+  } catch (e) {
+    console.error("[MODELS] refresh failed, using fallback:", e.message);
+  }
+  return MODELS;
+}
+
+function isModelAllowed(model) {
+  return MODELS.includes(model) || process.env.ALLOW_ANY_MODEL === "1";
+}
 
 // Track sessions per user (rotate every 30 min)
 const userSessions = {};
@@ -78,7 +146,7 @@ function zenRequest(model, messages, stream, tools, tool_choice, sessionId) {
       headers: {
         "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(body),
-        "Authorization": "Bearer public",
+        "Authorization": `Bearer ${ZEN_TOKEN}`,
         "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
         "x-opencode-client": "cli",
         "x-opencode-project": "global",
@@ -487,7 +555,7 @@ app.post("/v1/chat/completions", (req, res) => {
   if (!user) return res.status(401).json({ error: { message: "Invalid API key" } });
 
   const { model, messages, stream, tools, tool_choice } = req.body;
-  if (!MODELS.includes(model)) {
+  if (!isModelAllowed(model)) {
     return res.status(400).json({ error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
   }
 
@@ -507,7 +575,7 @@ app.post("/v1/messages", async (req, res) => {
   }
 
   const { model, stream } = req.body;
-  if (!MODELS.includes(model)) {
+  if (!isModelAllowed(model)) {
     return res.status(400).json({
       type: "error",
       error: { type: "invalid_request_error", message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` },
@@ -549,11 +617,122 @@ app.post("/v1/messages", async (req, res) => {
 // ── Health ──────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({
   status: "ok", version: `v${PROXY_VERSION}`, models: MODELS.length,
-  endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/models"],
+  endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"],
+  upstream: ZEN_TOKEN === "public" ? "anonymous(Bearer public)" : "token(env)",
+  models_source: MODELS_SOURCE,
 }));
 
 // ── Start ──────────────────────────────────────────────────────────
+// ── OpenAI Responses API (/v1/responses) ───────────────────────────
+function responsesContentToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((c) => {
+      if (typeof c === "string") return c;
+      if (c && (c.type === "input_text" || c.type === "output_text" || c.type === "text")) return c.text || "";
+      if (c && c.type === "input_image") return "[image omitted]";
+      return c && c.text ? c.text : "";
+    }).join("");
+  }
+  return content == null ? "" : String(content);
+}
+
+function responsesToMessages(body) {
+  const messages = [];
+  if (body.instructions) messages.push({ role: "system", content: body.instructions });
+  const input = body.input;
+  if (typeof input === "string") {
+    messages.push({ role: "user", content: input });
+  } else if (Array.isArray(input)) {
+    for (const item of input) {
+      if (!item) continue;
+      if (typeof item === "string") { messages.push({ role: "user", content: item }); continue; }
+      const role = item.role || (item.type === "message" ? "user" : null);
+      if (role) messages.push({ role, content: responsesContentToText(item.content) });
+      else if (item.type === "function_call_output") messages.push({ role: "tool", tool_call_id: item.call_id, content: responsesContentToText(item.output) });
+    }
+  }
+  if (!messages.length) messages.push({ role: "user", content: "" });
+  return messages;
+}
+
+function responsesToolsToChat(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  const out = tools.filter((t) => t && t.type === "function").map((t) => ({
+    type: "function",
+    function: { name: t.name, description: t.description || "", parameters: t.parameters || { type: "object", properties: {} } },
+  }));
+  return out.length ? out : undefined;
+}
+
+app.post("/v1/responses", async (req, res) => {
+  const user = auth(req);
+  if (!user) return res.status(401).json({ error: { type: "authentication_error", message: "Invalid API key" } });
+
+  const body = req.body || {};
+  const model = body.model;
+  if (!model || !isModelAllowed(model)) {
+    return res.status(400).json({ error: { type: "invalid_request_error", message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
+  }
+
+  const sessionId = getSession(user);
+  const { body: upstreamBody, options } = zenRequest(model, responsesToMessages(body), false, responsesToolsToChat(body.tools), body.tool_choice, sessionId);
+
+  let zenResp;
+  try {
+    zenResp = await zenRequestFull(options, upstreamBody);
+  } catch (e) {
+    return res.status(502).json({ error: { type: "upstream_error", message: e.message === "timeout" ? "Upstream timeout" : "Upstream error: " + e.message } });
+  }
+
+  const data = zenResp && zenResp.data;
+  if (zenResp && (zenResp.status === 429 || (data && data.error))) {
+    const msg = (data && data.error && (data.error.message || data.error.type)) || "rate_limit_error";
+    return res.status(429).json({ error: { type: "rate_limit_error", message: `${msg} (set OPENCODE_TOKEN to use your own account quota)` } });
+  }
+  if (!data || !data.choices) return res.status(502).json({ error: { type: "upstream_error", message: "Invalid upstream response" } });
+
+  const text = (data.choices[0].message && data.choices[0].message.content) || "";
+  const usage = data.usage || {};
+  const created = Math.floor(Date.now() / 1000);
+  const respId = "resp_" + crypto.randomBytes(12).toString("hex");
+  const itemId = "msg_" + crypto.randomBytes(8).toString("hex");
+  const usageOut = { input_tokens: usage.prompt_tokens || 0, output_tokens: usage.completion_tokens || 0, total_tokens: usage.total_tokens || 0 };
+
+  if (body.stream) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    const send = (obj) => res.write(`event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`);
+    const part = { type: "output_text", text: "", annotations: [] };
+    send({ type: "response.created", response: { id: respId, object: "response", created_at: created, model, status: "in_progress", output: [] } });
+    send({ type: "response.output_item.added", output_index: 0, item: { id: itemId, type: "message", role: "assistant", status: "in_progress", content: [] } });
+    send({ type: "response.content_part.added", item_id: itemId, output_index: 0, content_index: 0, part });
+    for (let i = 0; i < text.length; i += 200) {
+      send({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: text.slice(i, i + 200) });
+    }
+    send({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text });
+    send({ type: "response.output_item.done", output_index: 0, item: { id: itemId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] } });
+    send({ type: "response.completed", response: { id: respId, object: "response", created_at: created, model, status: "completed", output: [{ id: itemId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] }], usage: usageOut } });
+    return res.end();
+  }
+
+  return res.json({
+    id: respId,
+    object: "response",
+    created_at: created,
+    model,
+    status: "completed",
+    output: [{ id: itemId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] }],
+    usage: usageOut,
+  });
+});
+
 app.listen(PORT, "0.0.0.0", () => {
+  refreshModels();
   console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://0.0.0.0:${PORT}`);
   console.log("  OpenAI:    POST /v1/chat/completions");
   console.log("  Anthropic: POST /v1/messages");

@@ -1,3 +1,7 @@
+> **2026-11-19 本地修复版（v9-fix1）**
+> 上游 `opencode.ai/zen` 已收紧匿名通道：`Authorization: Bearer public` 现在返回 `429 FreeUsageLimitError`，且原版硬编码的 5 个模型中 4 个已下架。
+> 本次改动：动态模型白名单 / `OPENCODE_TOKEN` 凭证注入 / 新增 `POST /v1/responses` / 429 错误带配置指引。详见 `CHANGELOG-fix.md`。
+
 # opencode-free-proxy
 
 Free AI models from [OpenCode](https://opencode.ai) exposed as standard OpenAI and Anthropic APIs.
